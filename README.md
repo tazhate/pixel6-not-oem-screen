@@ -1,32 +1,34 @@
 # Pixel 6 Non-OEM Screen Touch Fix
 
-Fix for touchscreen "warmup" bug after replacing the Pixel 6 (oriole) screen
-with a non-OEM panel. After replacement, the first touch after a few seconds
-idle is missed, and long press detection is unreliable.
+Fix for touchscreen bugs after replacing the Pixel 6 (oriole) screen with a
+non-OEM panel. After replacement, the first touch after idle is missed, long
+press and key repeat (hold backspace) are broken.
 
 ## Status
 
 | Issue | Status |
 |-------|--------|
-| Cold tap warmup (first touch after idle missed) | ✅ Fixed |
-| Long press broken | 🔄 Partially working (see below) |
-| Dead zones at bottom rows | ✅ Fixed (production autotune) |
+| Cold tap warmup (first touch after idle missed) | Fixed |
+| Long press broken at 308ms | Fixed (fts_filter suppresses force-cal glitch) |
+| Hold key repeat (backspace etc.) | Fixed (~4s continuous, then re-touch) |
+| Dead zones at bottom rows | Fixed (production autotune) |
+| Fast typing artifacts | Fixed (MIN_HOLD_MS gate) |
 
 ## Quick Start
 
 Requires root (Magisk).
 
-### 1. Build the daemon
+### 1. Build the filter
 
 ```bash
-aarch64-linux-gnu-gcc -static -O2 -pthread -o fts_daemon fts_daemon.c
+aarch64-linux-gnu-gcc -static -O2 -pthread -o fts_filter fts_filter.c
 ```
 
 ### 2. Deploy and run
 
 ```bash
-adb push fts_daemon /data/local/tmp/fts_daemon
-adb shell "su -c '/data/local/tmp/fts_daemon &'"
+adb push fts_filter /data/local/tmp/fts_filter
+adb shell "su -c 'nohup /data/local/tmp/fts_filter > /data/local/tmp/fts_filter.log 2>&1 &'"
 ```
 
 ### 3. Apply boot-time baseline fixes (one-time)
@@ -48,6 +50,18 @@ adb shell "su -c 'resetprop vendor.twoshay.adaptive_touch_sensitivity 0'"
 
 For persistence, add to Magisk module `service.sh` (see `service.sh`).
 
+## Architecture
+
+```
+IC (ftm5) → kernel driver → /dev/input/event3 → [fts_filter EVIOCGRAB]
+                                                       ↓ (filter)
+                                                  /dev/uinput → Android
+```
+
+`fts_filter` exclusively grabs the real touchscreen via EVIOCGRAB, filters
+force-calibration glitches, and forwards clean events to a virtual uinput
+device that Android uses as its touchscreen.
+
 ## How It Works
 
 ### Root Cause
@@ -59,32 +73,54 @@ SPI bus and scans at low rate. The first touch wakes the IC but is missed.
 `SCAN_MODE_LOCKED + LOCKED_ACTIVE` (`18 03 00` via `/proc/fts/driver_test`)
 prevents the IC from entering LPA, fixing the warmup issue.
 
-### Long Press Side Effect
+### Force-Cal Side Effect
 
 In LOCKED_ACTIVE mode, the IC firmware detects "mutual frame flatness" at
 ~308ms of sustained touch (finger absorbed into baseline) and forces a
-recalibration. This sends `EVT_ID_LEAVE_POINT` → spurious `BTN_TOUCH UP`
+recalibration. This sends `EVT_ID_LEAVE_POINT` -> spurious `BTN_TOUCH UP`
 even though the finger is still on screen.
 
-`fts_daemon` detects this: on any `BTN_TOUCH UP` it immediately re-sends
-`18 03 00`. If the finger is still present, the IC re-detects it and sends
-a new `EVT_ID_ENTER_POINT` → `BTN_TOUCH DOWN`. Long press fires at ~800ms
-of continuous hold (vs normal ~500ms).
+### fts_filter Solution
 
-### Daemon Behavior
+**State machine** with two states:
 
-```
-[idle]     keepalive: 18 03 00 every 200ms  →  IC stays active, no LPA
-[touch DOWN]   stop keepalive
-[touch UP]     send 18 03 00 immediately
-               if finger still on screen → IC re-detects → new BTN_DOWN
-```
+**ST_FORWARD** (normal):
+- All events forwarded to uinput as-is
+- On BTN_TOUCH UP with hold >= 280ms: send re-arm (`18 03 00`) immediately,
+  enter ST_SUPPRESS
+
+**ST_SUPPRESS** (waiting for force-cal re-detection):
+- Buffer the UP frame, don't forward to Android
+- Wait up to 600ms for IC to re-detect the finger
+- If BTN_TOUCH DOWN arrives: suppress the glitch (Android never sees UP+DOWN)
+- If timeout: forward buffered UP (genuine finger lift)
+- Max 12 re-arm cycles per continuous touch (IC degrades after ~15 cycles)
+
+**Additional features:**
+- Keepalive thread sends `18 03 00` every 200ms during idle (prevents LPA)
+- Keepalive paused during active touch and SUPPRESS (avoids IC interference)
+- Quick taps (< 280ms) bypass suppression entirely (no delay)
+- Startup retry loop for IC commands (handles proc file busy race)
+
+### Key Parameters
+
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| SUPPRESS_TIMEOUT_MS | 600 | Max wait for re-detection after force-cal |
+| MIN_HOLD_MS | 280 | Touches shorter than this bypass suppression |
+| MAX_REARMS | 12 | Max re-arm cycles before accepting UP |
+| KEEPALIVE_US | 200000 | Keepalive interval (200ms) |
 
 ## Known Limitations
 
-- Long press requires ~800ms hold instead of ~500ms
-- Subsequent long presses occasionally inconsistent (active research)
-- Daemon must be running — not yet integrated into Magisk module auto-start
+- Continuous hold limited to ~4 seconds (12 force-cal cycles), then releases.
+  Re-touch immediately to continue. This is a hardware limitation: each
+  re-arm cycle absorbs more finger signal into the IC baseline until
+  detection fails.
+- Genuine finger lift delayed up to 600ms after long hold (SUPPRESS timeout).
+- `CMD_FORCE_TOUCH_ACTIVE` (`A0 01`) is a bus/power management command, NOT
+  an IC scan mode command. It keeps the SPI bus with AP but does not affect
+  force-cal or re-detection.
 
 ## Key Commands Reference
 
@@ -92,26 +128,26 @@ All via `/proc/fts/driver_test`:
 
 | Command | Effect |
 |---------|--------|
-| `echo "A0 01" > /proc/fts/driver_test` | Force touch active (AP owns SPI bus) |
-| `echo "18 03 00" > /proc/fts/driver_test` | LOCKED_ACTIVE — prevents LPA ✅ |
-| `echo "18 00 00" > /proc/fts/driver_test` | ACTIVE mode — LPA allowed ❌ |
-| `echo "81 00" > /proc/fts/driver_test` | Disable background baseline adaptation |
+| `A0 01` | CMD_FORCE_TOUCH_ACTIVE: keeps SPI bus with AP, holds wakelock |
+| `18 03 00` | LOCKED_ACTIVE — prevents LPA, causes force-cal at 308ms |
+| `18 00 00` | ACTIVE mode — LPA allowed |
+| `81 00` | Disable background baseline adaptation (does NOT fix force-cal) |
 
-## Next Steps / Open Problems
+## Files
 
-1. **Long press consistency** — daemon re-arm approach works but timing is
-   fragile. Looking into kernel-level fix (kprobe on `fts_status_event_handler`).
+| File | Description |
+|------|-------------|
+| `fts_filter.c` | EVIOCGRAB + uinput touch event filter (main fix) |
+| `fts_daemon.c` | Legacy daemon (no EVIOCGRAB, visible UP+DOWN glitches) |
+| `service.sh` | Magisk module boot script |
+| `FINDINGS.md` | Full research notes and driver analysis |
 
-2. **Kernel module fix** — `CONFIG_KPROBES=y` on this kernel. Plan:
-   hook `EVT_TYPE_STATUS_FORCE_CAL` event handler, call `setScanMode(LOCKED_ACTIVE)`
-   when `touch_id != 0` to prevent tracking loss without mode switch races.
+## Next Steps
 
-3. **Persistent daemon** — integrate `fts_daemon` into Magisk module service.sh.
-
-## Technical Details
-
-See [FINDINGS.md](FINDINGS.md) for full research notes, driver internals,
-all attempted approaches, and kernel module implementation plan.
+1. **Kernel kprobe module** — hook `fts_status_event_handler` to suppress
+   LEAVE_POINT during force-cal. Would eliminate the ~4s hold limit.
+2. **Optimize re-arm timing** — IC re-detection varies 5-915ms; adaptive
+   timeout could improve responsiveness.
 
 ## Device Info
 

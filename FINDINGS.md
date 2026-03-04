@@ -99,6 +99,91 @@ prevent the IC firmware from entering LPA internally — warmup persists.
 | `18 03 02` (LOCKED_IDLE) | All touch broken |
 | `18 03 10`, `18 03 11` (LP modes) | All touch broken |
 | **Daemon: re-arm `18 03 00` on every BTN_UP** | **First long press worked! Inconsistent after.** |
+| **EVIOCGRAB + uinput filter (fts_filter)** | **Best fix: suppresses force-cal glitches, ~4s continuous hold** |
+
+## EVIOCGRAB + uinput Filter (fts_filter) — Current Best Fix
+
+### Approach
+
+Exclusively grab `/dev/input/event3` via EVIOCGRAB, filter force-cal glitches
+in userspace, forward clean events to a virtual uinput device.
+
+### Key Discoveries During Development
+
+**1. Re-arm timing is critical:**
+The `18 03 00` command must be sent IMMEDIATELY on the `BTN_TOUCH 0` event,
+before `SYN_REPORT`. Waiting for the full frame to complete misses the IC's
+re-detection window.
+
+**2. Keepalive interferes with re-detection:**
+The keepalive thread (200ms ping) MUST be paused during the SUPPRESS window.
+If keepalive sends `18 03 00` during the ~356ms re-detection period, it resets
+the IC before it can re-detect the finger. Fix: keep `touching=1` during
+SUPPRESS so keepalive stays paused.
+
+**3. IC re-detection timing is variable:**
+Measured via `grab_test.c` (EVIOCGRAB + re-arm, no uinput):
+- First re-detection after force-cal: ~282-356ms
+- Subsequent re-detections: 5-146ms (usually 34-95ms)
+- Outliers: up to 915ms (!) — 500ms timeout was too short
+
+**4. IC baseline degradation limits hold duration:**
+Each force-cal re-arm cycle absorbs more of the finger's signal into the IC
+baseline. After ~12-15 cycles (~4 seconds of continuous hold):
+- Reported pressure drops from 60-80 to 16 (near detection threshold)
+- Re-detection slows from 50-200ms to 400-900ms
+- Eventually re-detection fails completely
+- IC may enter a bad state requiring seconds to recover
+
+**5. `A0 01` is NOT an IC command:**
+`CMD_FORCE_TOUCH_ACTIVE` in the procfs handler maps to `fts_set_bus_ref()`:
+```c
+case CMD_FORCE_TOUCH_ACTIVE:
+    fts_set_bus_ref(info, FTS_BUS_REF_FORCE_ACTIVE, cmd[1]);
+    __pm_stay_awake(info->wakesrc);
+```
+It keeps the SPI bus with the AP (prevents SLPI takeover) and holds a wakelock.
+It does NOT send any command to the IC and does NOT affect force-cal or
+re-detection timing.
+
+**6. `setScanMode(LOCKED_ACTIVE)` sends `A0 03 00` over SPI:**
+```c
+// ftsCore.c:339
+u8 cmd1[7] = {0xFA, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00};  // preamble
+u8 cmd[3]  = {0xA0, 0x03, 0x00};  // FTS_CMD_SCAN_MODE + LOCKED + ACTIVE
+```
+
+**7. Force-cal is entirely firmware-autonomous:**
+The driver has zero suppression logic. `fts_status_event_handler()` for
+`EVT_TYPE_STATUS_FORCE_CAL` is purely logging — no state is saved, no action
+taken. The LEAVE_POINT (and resulting BTN_TOUCH UP) is processed unconditionally.
+
+**8. Force-cal trigger types (from ftsSoftware.h):**
+| Code | Trigger |
+|------|---------|
+| 0x01 | Sense on force cal (sense off→on transition) |
+| 0x02 | Host command force cal |
+| 0x10-0x11 | Mutual frame drop / pure raw |
+| 0x20-0x23 | Self detect/touch negative/flatness |
+| 0x30-0x35 | Invalid/flatness calibration (0x35 = mutual frame flatness) |
+
+**9. Startup race condition:**
+When fts_filter starts immediately after killing a previous instance,
+`/proc/fts/driver_test` may still be held open. Both `A0 01` and `18 03 00`
+fail with EBUSY. Fix: retry loop with 200ms backoff.
+
+**10. twoshay does NOT use event3:**
+twoshay reads from `/dev/touch_offload` (heatmap frames), not
+`/dev/input/event3`. EVIOCGRAB on event3 does not affect twoshay.
+
+### Parameters Tuned
+
+| Parameter | Final Value | Reason |
+|-----------|-------------|--------|
+| SUPPRESS_TIMEOUT_MS | 600 | Catches re-detections up to 600ms (grab_test showed up to 915ms but 600 is a good balance) |
+| MIN_HOLD_MS | 280 | Force-cal happens at ~308ms. Taps <280ms are real lifts, bypass suppression. Prevents typing delays. |
+| MAX_REARMS | 12 | After 12 re-arm cycles, IC baseline is too degraded. Accept UP to prevent hang. |
+| KEEPALIVE_US | 200000 | 200ms << 117ms LPA threshold. Keeps IC active between touches. |
 
 ## Long Press Root Cause (Detailed)
 
@@ -118,9 +203,13 @@ Driver event chain:
 (`ADDR_CONFIG_AUTOCAL = 0x0040`). The frame-flatness force-cal is a separate
 firmware mechanism and cannot be disabled with 0x81.
 
-## Current Best Fix: fts_daemon
+## Current Best Fix: fts_filter
 
-See `fts_daemon.c`. Two-part approach:
+See `fts_filter.c`. EVIOCGRAB + uinput approach (described above).
+
+## Legacy Fix: fts_daemon
+
+See `fts_daemon.c`. Simple re-arm approach (no EVIOCGRAB, glitches visible to Android):
 
 **Part 1 — Anti-LPA keepalive:**
 Send `18 03 00` every 200ms while no touch is active.
@@ -172,15 +261,16 @@ Key symbols in `/proc/kallsyms`:
 
 Current module at `/data/adb/modules/pixel6_touch_fix/service.sh`:
 - Runs at boot: glove_mode=1, production autotune (01 00 + 02 00), grip_enabled=0, adaptive_touch_sensitivity=0
-- Old stm_fts_cmd keepalive (13 00 every 50ms) — superseded by fts_daemon
-- TODO: replace old keepalive with fts_daemon for persistent fix
+- Old stm_fts_cmd keepalive (13 00 every 50ms) — superseded by fts_filter
+- TODO: replace old keepalive with fts_filter for persistent fix
 
 ## Files
 
 | File | Description |
 |------|-------------|
 | `service.sh` | Current Magisk module boot script |
-| `fts_daemon.c` | Userspace daemon — anti-LPA keepalive + long press re-arm |
+| `fts_filter.c` | EVIOCGRAB + uinput touch event filter (current best fix) |
+| `fts_daemon.c` | Legacy daemon — anti-LPA keepalive + long press re-arm |
 | `touchflow_original.pb` | Original `/vendor/etc/touchflow.pb` (147 bytes) |
 | `twoshay_config_no_touchflow.json` | twoshay pipeline without TouchflowAlgorithm |
 | `twoshay_config_bare.json` | Minimal pipeline (Segmentation+Reporting only) |
