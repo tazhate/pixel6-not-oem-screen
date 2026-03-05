@@ -1,6 +1,9 @@
 #!/system/bin/sh
 sleep 5
 
+MODDIR="${0%/*}"
+TAG="pixel6_touch_fix"
+
 # Enable glove mode (hardware sensitivity boost)
 chmod 666 /sys/bus/spi/drivers/fts/spi11.0/glove_mode
 echo 1 > /sys/bus/spi/drivers/fts/spi11.0/glove_mode
@@ -28,32 +31,47 @@ sleep 1
 # Load kernel kprobe module: in-kernel force-cal suppression
 # Intercepts fts_leave/status/enter handlers to prevent spurious BTN_TOUCH UP.
 # Works alongside fts_filter (complementary layers).
-KPROBE="/data/local/tmp/ftm5_kprobe.ko"
-if [ -f "$KPROBE" ]; then
+#
+# Search order: Magisk module dir → /data/local/tmp
+KPROBE=""
+for p in "$MODDIR/ftm5_kprobe.ko" "/data/local/tmp/ftm5_kprobe.ko"; do
+    [ -f "$p" ] && KPROBE="$p" && break
+done
+
+if [ -n "$KPROBE" ]; then
     # Unload old instance if present
     rmmod ftm5_kprobe 2>/dev/null
+
+    # Version check: warn if kernel changed since module was built
+    KVER=$(uname -r)
+    log -t "$TAG" "kernel: $KVER, loading: $KPROBE"
+
     insmod "$KPROBE" 2>/dev/null
     if [ $? -eq 0 ]; then
-        log -t "pixel6_touch_fix" "ftm5_kprobe loaded"
+        log -t "$TAG" "ftm5_kprobe loaded"
     else
-        log -t "pixel6_touch_fix" "ftm5_kprobe insmod failed, trying force-load"
+        log -t "$TAG" "ftm5_kprobe insmod failed, trying force-load"
         insmod -f "$KPROBE" 2>/dev/null && \
-            log -t "pixel6_touch_fix" "ftm5_kprobe force-loaded" || \
-            log -t "pixel6_touch_fix" "ftm5_kprobe failed to load"
+            log -t "$TAG" "ftm5_kprobe force-loaded" || \
+            log -t "$TAG" "ftm5_kprobe FAILED (kernel=$KVER)"
     fi
 else
-    log -t "pixel6_touch_fix" "ftm5_kprobe.ko not found, skipping"
+    log -t "$TAG" "ftm5_kprobe.ko not found, skipping"
 fi
 
 # Start fts_filter: EVIOCGRAB + uinput touch event filter (userspace fallback)
 # Grabs real touchscreen, filters force-cal glitches, forwards to uinput.
 # With kprobe loaded, fts_filter provides additional safety net + keepalive.
-FILTER="/data/local/tmp/fts_filter"
-if [ -x "$FILTER" ]; then
+FILTER=""
+for p in "$MODDIR/fts_filter" "/data/local/tmp/fts_filter"; do
+    [ -x "$p" ] && FILTER="$p" && break
+done
+
+if [ -n "$FILTER" ]; then
     nohup "$FILTER" > /data/local/tmp/fts_filter.log 2>&1 &
-    log -t "pixel6_touch_fix" "fts_filter started (pid=$!)"
+    log -t "$TAG" "fts_filter started (pid=$!)"
 else
-    log -t "pixel6_touch_fix" "ERROR: $FILTER not found, falling back to keepalive"
+    log -t "$TAG" "ERROR: fts_filter not found, falling back to keepalive"
     # Fallback: old stm_fts_cmd keepalive
     (
       SYSFS="/sys/bus/spi/drivers/fts/spi11.0/stm_fts_cmd"

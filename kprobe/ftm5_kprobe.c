@@ -17,48 +17,83 @@
  * on new touch-down events.
  *
  * Struct offsets verified from ftm5.ko disassembly (android14-6.1, Pixel 6):
- *   touch_id:       0x11B0  (unsigned long, touch slot bitmask)
- *   palm_touch_mask: 0x11B8 (unsigned long)
- *   grip_touch_mask: 0x11C0 (unsigned long)
+ *   touch_id:        0x11B0  (unsigned long, touch slot bitmask)
+ *   palm_touch_mask: 0x11B8  (unsigned long)
+ *   grip_touch_mask: 0x11C0  (unsigned long)
  */
 
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/kprobes.h>
 #include <linux/workqueue.h>
-#include <linux/version.h>
-
-#define MAX_REARMS	12	/* Max force-cal suppress cycles per touch */
+#include <linux/spinlock.h>
+#include <linux/jiffies.h>
 
 /* Struct offsets from ftm5.ko disassembly */
 #define OFF_TOUCH_ID		0x11B0
 #define OFF_PALM_TOUCH_MASK	0x11B8
 #define OFF_GRIP_TOUCH_MASK	0x11C0
 
-/* Force-cal event sub-type for mutual frame flatness */
-#define FORCE_CAL_MUTUAL_FLATNESS	0x35
-
 /* Scan mode constants (from ftsSoftware.h) */
 #define SCAN_MODE_LOCKED	0x03
 #define LOCKED_ACTIVE		0x00
 
-/* Saved state between kprobe 1 and kprobe 2 */
-static unsigned long saved_touch_id;
-static unsigned long saved_palm_mask;
-static unsigned long saved_grip_mask;
-static void *saved_info;		/* fts_ts_info pointer */
-static int rearm_count;			/* per-touch rearm counter */
-static bool leave_in_progress;		/* flag: leave handler just ran */
+/*
+ * Max age for leave_in_progress flag (in jiffies).
+ * Events in the same SPI batch are processed in <1ms.
+ * 5ms (≈1-2 jiffies at HZ=250) is generous but prevents stale state
+ * from previous touch events leaking into new ones.
+ */
+#define LEAVE_MAX_AGE_MS	5
+
+/* Module parameters — tunable at load time or via sysfs */
+static int max_rearms = 12;
+module_param(max_rearms, int, 0644);
+MODULE_PARM_DESC(max_rearms, "Max force-cal suppress cycles per touch (default: 12)");
+
+/*
+ * Protected state between kprobe 1 (leave) and kprobe 2 (status).
+ * All fields guarded by state_lock.
+ *
+ * The ftm5 driver processes events under its own mutex, so concurrent
+ * kprobe invocations shouldn't happen. The spinlock protects against
+ * theoretical SMP races and ensures memory ordering.
+ */
+static DEFINE_SPINLOCK(state_lock);
+
+struct suppress_state {
+	unsigned long touch_id;
+	unsigned long palm_mask;
+	unsigned long grip_mask;
+	void *info;		/* fts_ts_info pointer */
+	unsigned long leave_jiffies;	/* when leave_pre fired */
+	bool leave_pending;	/* leave handler cleared touch_id */
+	int rearm_count;	/* per-touch rearm counter */
+};
+
+static struct suppress_state st;
 
 /* Resolved function pointer for setScanMode */
 static int (*fn_setScanMode)(void *info, u8 mode, u8 settings);
 
+/* Info pointer for workqueue (set under state_lock, read in work fn) */
+static void *work_info;
+
 /* Work struct for deferred setScanMode call */
 static struct work_struct rearm_work;
 
-/* Statistics */
+/* Statistics — readable via /sys/module/ftm5_kprobe/parameters/ */
 static unsigned long total_suppressed;
+module_param(total_suppressed, ulong, 0444);
+MODULE_PARM_DESC(total_suppressed, "Total force-cal events suppressed");
+
 static unsigned long total_rearms_exhausted;
+module_param(total_rearms_exhausted, ulong, 0444);
+MODULE_PARM_DESC(total_rearms_exhausted, "Times rearm limit was reached");
+
+static unsigned long total_stale_leaves;
+module_param(total_stale_leaves, ulong, 0444);
+MODULE_PARM_DESC(total_stale_leaves, "Stale leave_pending states discarded");
 
 /*
  * Workqueue handler: re-arm IC to LOCKED_ACTIVE mode.
@@ -66,17 +101,34 @@ static unsigned long total_rearms_exhausted;
  */
 static void rearm_work_fn(struct work_struct *work)
 {
+	void *info;
 	int ret;
 
-	if (!fn_setScanMode || !saved_info)
+	/* Read the info pointer that was set before scheduling */
+	info = READ_ONCE(work_info);
+	if (!fn_setScanMode || !info)
 		return;
 
-	ret = fn_setScanMode(saved_info, SCAN_MODE_LOCKED, LOCKED_ACTIVE);
+	ret = fn_setScanMode(info, SCAN_MODE_LOCKED, LOCKED_ACTIVE);
 	if (ret < 0)
 		pr_warn("ftm5_kprobe: setScanMode failed: %d\n", ret);
-	else
-		pr_debug("ftm5_kprobe: re-armed LOCKED_ACTIVE (cycle %d)\n",
-			 rearm_count);
+}
+
+/*
+ * Check if leave_pending is fresh (same SPI batch).
+ * Must be called with state_lock held.
+ */
+static inline bool leave_is_fresh(void)
+{
+	if (!st.leave_pending)
+		return false;
+
+	if (jiffies_to_msecs(jiffies - st.leave_jiffies) > LEAVE_MAX_AGE_MS) {
+		st.leave_pending = false;
+		total_stale_leaves++;
+		return false;
+	}
+	return true;
 }
 
 /*
@@ -88,21 +140,20 @@ static void rearm_work_fn(struct work_struct *work)
 static int leave_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
 	void *info = (void *)regs->regs[0];
-	unsigned char *event = (unsigned char *)regs->regs[1];
 	unsigned long cur_touch_id;
+	unsigned long flags;
 
-	/* Only care about finger-type events on valid touch IDs */
 	cur_touch_id = *(unsigned long *)((char *)info + OFF_TOUCH_ID);
 
 	if (cur_touch_id != 0) {
-		saved_touch_id = cur_touch_id;
-		saved_palm_mask = *(unsigned long *)((char *)info + OFF_PALM_TOUCH_MASK);
-		saved_grip_mask = *(unsigned long *)((char *)info + OFF_GRIP_TOUCH_MASK);
-		saved_info = info;
-		leave_in_progress = true;
-
-		pr_debug("ftm5_kprobe: leave_pre: saved touch_id=0x%lx event=%02x %02x\n",
-			 saved_touch_id, event[0], event[1]);
+		spin_lock_irqsave(&state_lock, flags);
+		st.touch_id = cur_touch_id;
+		st.palm_mask = *(unsigned long *)((char *)info + OFF_PALM_TOUCH_MASK);
+		st.grip_mask = *(unsigned long *)((char *)info + OFF_GRIP_TOUCH_MASK);
+		st.info = info;
+		st.leave_jiffies = jiffies;
+		st.leave_pending = true;
+		spin_unlock_irqrestore(&state_lock, flags);
 	}
 
 	return 0;
@@ -110,24 +161,30 @@ static int leave_pre_handler(struct kprobe *p, struct pt_regs *regs)
 
 /*
  * Kprobe 1 post-handler: check if touch_id was actually cleared.
- * If not (e.g. invalid touchType), cancel the pending restore.
+ * If not (e.g. multitouch with other fingers still down), cancel restore.
  */
 static void leave_post_handler(struct kprobe *p, struct pt_regs *regs,
-			       unsigned long flags)
+			       unsigned long flags_unused)
 {
 	unsigned long cur_touch_id;
+	unsigned long flags;
 
-	if (!leave_in_progress || !saved_info)
+	spin_lock_irqsave(&state_lock, flags);
+	if (!st.leave_pending || !st.info) {
+		spin_unlock_irqrestore(&state_lock, flags);
 		return;
-
-	cur_touch_id = *(unsigned long *)((char *)saved_info + OFF_TOUCH_ID);
-
-	/* If touch_id wasn't actually cleared, this wasn't a force-cal leave */
-	if (cur_touch_id != 0 || saved_touch_id == cur_touch_id) {
-		leave_in_progress = false;
-		pr_debug("ftm5_kprobe: leave_post: touch_id not cleared (0x%lx), "
-			 "canceling restore\n", cur_touch_id);
 	}
+
+	cur_touch_id = *(unsigned long *)((char *)st.info + OFF_TOUCH_ID);
+
+	/*
+	 * If touch_id wasn't fully cleared → other fingers still active.
+	 * Don't suppress — this isn't a force-cal-induced total lift.
+	 */
+	if (cur_touch_id != 0) {
+		st.leave_pending = false;
+	}
+	spin_unlock_irqrestore(&state_lock, flags);
 }
 
 /*
@@ -141,45 +198,52 @@ static int status_pre_handler(struct kprobe *p, struct pt_regs *regs)
 	void *info = (void *)regs->regs[0];
 	unsigned char *event = (unsigned char *)regs->regs[1];
 	unsigned long cur_touch_id;
+	unsigned long flags;
 
-	/* Only act if leave handler flagged a potential force-cal scenario */
-	if (!leave_in_progress)
+	spin_lock_irqsave(&state_lock, flags);
+
+	/* Check leave is fresh (same SPI batch) */
+	if (!leave_is_fresh()) {
+		spin_unlock_irqrestore(&state_lock, flags);
 		return 0;
+	}
 
-	/* Check this is actually a force-cal status event (event[1] == 0x05) */
+	/* Must be a force-cal status event (event[1] == 0x05) */
 	if (event[1] != 0x05) {
-		leave_in_progress = false;
+		st.leave_pending = false;
+		spin_unlock_irqrestore(&state_lock, flags);
 		return 0;
 	}
 
 	cur_touch_id = *(unsigned long *)((char *)info + OFF_TOUCH_ID);
 
-	if (cur_touch_id == 0 && saved_touch_id != 0) {
-		if (rearm_count < MAX_REARMS) {
+	if (cur_touch_id == 0 && st.touch_id != 0) {
+		if (st.rearm_count < max_rearms) {
 			/* Restore touch_id — prevent BTN_TOUCH UP */
-			*(unsigned long *)((char *)info + OFF_TOUCH_ID) = saved_touch_id;
-			*(unsigned long *)((char *)info + OFF_PALM_TOUCH_MASK) = saved_palm_mask;
-			*(unsigned long *)((char *)info + OFF_GRIP_TOUCH_MASK) = saved_grip_mask;
+			*(unsigned long *)((char *)info + OFF_TOUCH_ID) = st.touch_id;
+			*(unsigned long *)((char *)info + OFF_PALM_TOUCH_MASK) = st.palm_mask;
+			*(unsigned long *)((char *)info + OFF_GRIP_TOUCH_MASK) = st.grip_mask;
 
-			rearm_count++;
+			st.rearm_count++;
 			total_suppressed++;
 
 			pr_info("ftm5_kprobe: force-cal suppressed (cycle %d/%d, "
 				"sub=0x%02x, touch_id=0x%lx)\n",
-				rearm_count, MAX_REARMS,
-				event[2], saved_touch_id);
+				st.rearm_count, max_rearms,
+				event[2], st.touch_id);
 
-			/* Re-arm LOCKED_ACTIVE via workqueue (SPI needs process ctx) */
+			/* Save info ptr for workqueue and schedule re-arm */
+			WRITE_ONCE(work_info, st.info);
 			schedule_work(&rearm_work);
 		} else {
-			/* Exhausted rearms — let BTN_UP through */
 			total_rearms_exhausted++;
 			pr_info("ftm5_kprobe: rearm limit reached (%d), "
-				"allowing BTN_UP\n", MAX_REARMS);
+				"allowing BTN_UP\n", max_rearms);
 		}
 	}
 
-	leave_in_progress = false;
+	st.leave_pending = false;
+	spin_unlock_irqrestore(&state_lock, flags);
 	return 0;
 }
 
@@ -187,22 +251,28 @@ static int status_pre_handler(struct kprobe *p, struct pt_regs *regs)
  * Kprobe 3: pre-handler for fts_enter_pointer_event_handler
  *
  * Reset rearm counter on new touch-down (real ENTER_POINT).
- * This detects a fresh finger placement after a genuine lift.
+ * Also clear any stale leave_pending state.
  */
 static int enter_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
 	void *info = (void *)regs->regs[0];
 	unsigned long cur_touch_id;
+	unsigned long flags;
 
 	cur_touch_id = *(unsigned long *)((char *)info + OFF_TOUCH_ID);
 
-	/* If touch_id was 0 before this enter event → new touch-down */
-	if (cur_touch_id == 0 && rearm_count > 0) {
-		pr_info("ftm5_kprobe: new touch-down, reset rearm count "
-			"(was %d)\n", rearm_count);
-		rearm_count = 0;
+	spin_lock_irqsave(&state_lock, flags);
+
+	/* New touch-down (touch_id was 0 before this enter) → reset state */
+	if (cur_touch_id == 0) {
+		if (st.rearm_count > 0)
+			pr_info("ftm5_kprobe: new touch-down, reset rearm "
+				"(was %d)\n", st.rearm_count);
+		st.rearm_count = 0;
+		st.leave_pending = false;
 	}
 
+	spin_unlock_irqrestore(&state_lock, flags);
 	return 0;
 }
 
@@ -225,8 +295,6 @@ static struct kprobe kp_enter = {
 
 /*
  * Resolve setScanMode address using the kprobe registration trick.
- * Register a temporary kprobe on the symbol name, grab its address,
- * then unregister.
  */
 static int resolve_setScanMode(void)
 {
@@ -250,41 +318,36 @@ static int __init ftm5_kprobe_init(void)
 {
 	int ret;
 
-	pr_info("ftm5_kprobe: loading (MAX_REARMS=%d)\n", MAX_REARMS);
+	pr_info("ftm5_kprobe: loading v2 (max_rearms=%d)\n", max_rearms);
 
-	/* Initialize work struct */
 	INIT_WORK(&rearm_work, rearm_work_fn);
 
-	/* Resolve setScanMode function pointer */
 	ret = resolve_setScanMode();
 	if (ret < 0)
 		return ret;
 
-	/* Register kprobe on fts_leave_pointer_event_handler */
 	ret = register_kprobe(&kp_leave);
 	if (ret < 0) {
 		pr_err("ftm5_kprobe: register kp_leave failed: %d\n", ret);
 		return ret;
 	}
-	pr_info("ftm5_kprobe: kp_leave registered at %px\n", kp_leave.addr);
+	pr_info("ftm5_kprobe: kp_leave at %px\n", kp_leave.addr);
 
-	/* Register kprobe on fts_status_event_handler */
 	ret = register_kprobe(&kp_status);
 	if (ret < 0) {
 		pr_err("ftm5_kprobe: register kp_status failed: %d\n", ret);
 		goto err_unreg_leave;
 	}
-	pr_info("ftm5_kprobe: kp_status registered at %px\n", kp_status.addr);
+	pr_info("ftm5_kprobe: kp_status at %px\n", kp_status.addr);
 
-	/* Register kprobe on fts_enter_pointer_event_handler */
 	ret = register_kprobe(&kp_enter);
 	if (ret < 0) {
 		pr_err("ftm5_kprobe: register kp_enter failed: %d\n", ret);
 		goto err_unreg_status;
 	}
-	pr_info("ftm5_kprobe: kp_enter registered at %px\n", kp_enter.addr);
+	pr_info("ftm5_kprobe: kp_enter at %px\n", kp_enter.addr);
 
-	pr_info("ftm5_kprobe: loaded successfully — 3 kprobes active\n");
+	pr_info("ftm5_kprobe: loaded — 3 kprobes active\n");
 	return 0;
 
 err_unreg_status:
@@ -296,16 +359,14 @@ err_unreg_leave:
 
 static void __exit ftm5_kprobe_exit(void)
 {
-	/* Cancel any pending work */
 	cancel_work_sync(&rearm_work);
 
 	unregister_kprobe(&kp_enter);
 	unregister_kprobe(&kp_status);
 	unregister_kprobe(&kp_leave);
 
-	pr_info("ftm5_kprobe: unloaded (total suppressed: %lu, "
-		"rearm exhaustions: %lu)\n",
-		total_suppressed, total_rearms_exhausted);
+	pr_info("ftm5_kprobe: unloaded (suppressed=%lu exhausted=%lu stale=%lu)\n",
+		total_suppressed, total_rearms_exhausted, total_stale_leaves);
 }
 
 module_init(ftm5_kprobe_init);
@@ -314,4 +375,4 @@ module_exit(ftm5_kprobe_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Denis");
 MODULE_DESCRIPTION("Kprobe module to suppress force-cal BTN_TOUCH UP on ftm5 (Pixel 6 non-OEM screen)");
-MODULE_VERSION("1.0");
+MODULE_VERSION("2.0");
