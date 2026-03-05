@@ -226,23 +226,128 @@ App sees: `DOWN → UP(308ms) → DOWN → UP(real)` — long press fires at ~80
 ~500ms, due to the spurious UP + re-detection cycle. Inconsistency observed
 on subsequent presses — needs further testing.
 
-## Kernel Module Approach (Next Step)
+## Kernel Kprobe Module (ftm5_kprobe) — Implemented
 
-The cleanest fix is a kernel-space kprobe module:
-- Hook `fts_status_event_handler` at `EVT_TYPE_STATUS_FORCE_CAL`
-- If `info->touch_id != 0`: call `setScanMode(LOCKED_ACTIVE)` to re-arm IC
-- This happens before LEAVE_POINT is processed → can potentially prevent tracking loss
+In-kernel force-cal suppression via three kprobes. Prevents spurious BTN_TOUCH UP
+at the driver level — Android never sees the lift event.
 
-Prerequisites:
-- `CONFIG_KPROBES=y` ✓ (confirmed on running kernel)
-- `CONFIG_KALLSYMS_ALL=y` ✓ — all ftm5 symbols visible in `/proc/kallsyms`
-- `ftm5.ko` at `/vendor/lib/modules/ftm5.ko` (loads with relaxed vermagic on GKI)
-- Need: android14-6.1 kernel headers + android14 clang toolchain to build
+### Architecture
 
-Key symbols in `/proc/kallsyms`:
-- `fts_leave_pointer_event_handler [ftm5]`
-- `fts_status_event_handler [ftm5]`
-- `setScanMode [ftm5]`
+```
+IC event batch (single SPI read, same context):
+  LEAVE_POINT → fts_leave_pointer_event_handler()  ← Kprobe 1: save touch_id
+                  ↓ handler clears touch_id
+  FORCE_CAL   → fts_status_event_handler()          ← Kprobe 2: restore touch_id
+                  ↓ touch_id != 0 (restored)
+  After loop: touch_id != 0 → NO BTN_TOUCH UP       ← Android never sees lift
+```
+
+### Three Kprobes
+
+1. **`fts_leave_pointer_event_handler`** (pre+post handler):
+   - pre: save `touch_id`, `palm_touch_mask`, `grip_touch_mask` from `fts_ts_info`
+   - post: verify touch_id was actually cleared (cancel if not — e.g. invalid touchType)
+
+2. **`fts_status_event_handler`** (pre handler):
+   - Check `event[1] == 0x05` (force-cal status event)
+   - If `touch_id == 0` and `saved_touch_id != 0` and `rearm_count < MAX_REARMS`:
+     restore all three bitmasks, schedule `setScanMode(LOCKED_ACTIVE)` via workqueue
+
+3. **`fts_enter_pointer_event_handler`** (pre handler):
+   - Reset `rearm_count` to 0 on new touch-down (when `touch_id` was 0)
+
+### Struct Offsets (verified from ftm5.ko disassembly)
+
+| Field | Offset | Type |
+|-------|--------|------|
+| `touch_id` | 0x11B0 | `unsigned long` (touch slot bitmask) |
+| `palm_touch_mask` | 0x11B8 | `unsigned long` |
+| `grip_touch_mask` | 0x11C0 | `unsigned long` |
+
+### setScanMode Resolution
+
+Kernel modules can't import symbols from other modules directly. Resolved
+`setScanMode` address at init time using the kprobe registration trick:
+
+```c
+struct kprobe kp_tmp = { .symbol_name = "setScanMode" };
+register_kprobe(&kp_tmp);
+fn_setScanMode = (void *)kp_tmp.addr;
+unregister_kprobe(&kp_tmp);
+```
+
+Workqueue handler calls `fn_setScanMode(saved_info, 0x03, 0x00)` — kprobe
+handlers run with preemption disabled so SPI I/O must be deferred to process
+context.
+
+### Build Challenges
+
+**1. MODVERSIONS CRC extraction:**
+The running kernel enforces MODVERSIONS — each imported symbol must carry the
+correct CRC in the module's `__versions` section. CRCs were obtained from:
+- `ftm5.ko` `__versions` section (7 symbols: module_layout, _printk, memset, etc.)
+- `bcmdhd4389.ko` `__versions` (system_wq)
+- Kernel binary `kcrctab` section (register_kprobe, unregister_kprobe)
+
+The kernel's `kcrctab` stores **absolute CRC values** (not PREL32 relative),
+despite `CONFIG_HAVE_ARCH_PREL32_RELOCATIONS=y`. Verified by matching known
+CRCs from module `__versions` sections.
+
+**2. Struct module size mismatch (0x400 vs 0x440):**
+Initial builds crashed at `mod_sysfs_setup+0x208` because `.gnu.linkonce.this_module`
+section was 1024 bytes instead of the expected 1088 bytes. The 64-byte difference
+was caused by `CONFIG_DEBUG_INFO_BTF_MODULES=y` being missing — it adds 16 bytes
+(`btf_data_size` + `btf_data` pointer) to `struct module`, which rounds up to
++64 bytes due to `____cacheline_aligned` (64-byte boundary).
+
+Fix: manually inject `CONFIG_DEBUG_INFO_BTF_MODULES=y` into the kernel headers'
+`autoconf.h` and `auto.conf`.
+
+**3. Toolchain:**
+`CONFIG_CFI_CLANG=y` requires clang (not gcc). Build uses:
+- `clang-18` as compiler
+- `ld.lld-18` as linker
+- Full LLVM-18 toolchain (ar, nm, strip, objcopy, objdump)
+
+**4. File transfer (FBE/mount namespace):**
+Files pushed via `adb push` are not visible in Magisk su context due to
+File-Based Encryption mount namespaces. Fix: pipe transfer:
+```bash
+cat module.ko | adb shell "su -c 'cat > /data/local/tmp/module.ko'"
+```
+
+### Module.symvers (all CRCs)
+
+```
+0xea759d7f  module_layout     vmlinux  EXPORT_SYMBOL
+0x92997ed8  _printk           vmlinux  EXPORT_SYMBOL
+0xdcb764ad  memset            vmlinux  EXPORT_SYMBOL
+0x4829a47e  memcpy            vmlinux  EXPORT_SYMBOL
+0xc2c193d2  __stack_chk_fail  vmlinux  EXPORT_SYMBOL
+0xd969d6f4  cancel_work_sync  vmlinux  EXPORT_SYMBOL_GPL
+0x732ac580  queue_work_on     vmlinux  EXPORT_SYMBOL
+0x56470118  __warn_printk     vmlinux  EXPORT_SYMBOL
+0x2d3385d3  system_wq         vmlinux  EXPORT_SYMBOL
+0x0472cf3b  register_kprobe   vmlinux  EXPORT_SYMBOL_GPL
+0xeb78b1ed  unregister_kprobe vmlinux  EXPORT_SYMBOL_GPL
+```
+
+### Deployment
+
+```bash
+# Build
+cd kprobe && make
+
+# Deploy
+cat ftm5_kprobe.ko | adb shell "su -c 'cat > /data/local/tmp/ftm5_kprobe.ko'"
+adb shell "su -c 'insmod /data/local/tmp/ftm5_kprobe.ko'"
+adb shell "su -c 'dmesg'" | grep ftm5_kprobe
+
+# Verify: all 3 kprobes registered
+# ftm5_kprobe: kp_leave registered at <addr>
+# ftm5_kprobe: kp_status registered at <addr>
+# ftm5_kprobe: kp_enter registered at <addr>
+```
 
 ## ftm5 Driver Facts
 
@@ -268,9 +373,12 @@ Current module at `/data/adb/modules/pixel6_touch_fix/service.sh`:
 
 | File | Description |
 |------|-------------|
-| `service.sh` | Current Magisk module boot script |
-| `fts_filter.c` | EVIOCGRAB + uinput touch event filter (current best fix) |
+| `kprobe/ftm5_kprobe.c` | Kernel kprobe module — in-kernel force-cal suppression |
+| `kprobe/Makefile` | Cross-compile build (clang-18, ARM64) |
+| `kprobe/test_module.c` | Minimal test module for verifying build/load pipeline |
+| `fts_filter.c` | EVIOCGRAB + uinput touch event filter (userspace fix) |
 | `fts_daemon.c` | Legacy daemon — anti-LPA keepalive + long press re-arm |
+| `service.sh` | Magisk module boot script (loads kprobe + starts fts_filter) |
 | `touchflow_original.pb` | Original `/vendor/etc/touchflow.pb` (147 bytes) |
 | `twoshay_config_no_touchflow.json` | twoshay pipeline without TouchflowAlgorithm |
 | `twoshay_config_bare.json` | Minimal pipeline (Segmentation+Reporting only) |

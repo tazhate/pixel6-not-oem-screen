@@ -9,10 +9,14 @@ press and key repeat (hold backspace) are broken.
 | Issue | Status |
 |-------|--------|
 | Cold tap warmup (first touch after idle missed) | Fixed |
-| Long press broken at 308ms | Fixed (fts_filter suppresses force-cal glitch) |
-| Hold key repeat (backspace etc.) | Fixed (~4s continuous, then re-touch) |
+| Long press broken at 308ms | Fixed (fts_filter + kprobe suppress force-cal) |
+| Hold key repeat (backspace etc.) | Fixed (kprobe: in-kernel suppression) |
 | Dead zones at bottom rows | Fixed (production autotune) |
 | Fast typing artifacts | Fixed (MIN_HOLD_MS gate) |
+
+Two complementary solutions:
+- **`fts_filter`** (userspace) — EVIOCGRAB + uinput filter, ~4s continuous hold limit
+- **`ftm5_kprobe`** (kernel) — in-kernel force-cal suppression via kprobes, eliminates BTN_UP at source
 
 ## Quick Start
 
@@ -111,13 +115,63 @@ even though the finger is still on screen.
 | MAX_REARMS | 12 | Max re-arm cycles before accepting UP |
 | KEEPALIVE_US | 200000 | Keepalive interval (200ms) |
 
+## Kernel Kprobe Module (ftm5_kprobe)
+
+In-kernel solution that intercepts force-cal events before they reach Android.
+Unlike fts_filter (userspace), this prevents the spurious BTN_TOUCH UP at the
+kernel driver level — Android never sees it.
+
+### How It Works
+
+Three kprobes on ftm5 driver functions:
+
+1. **`fts_leave_pointer_event_handler`** (pre+post) — saves `touch_id` bitmask
+   before the handler clears it
+2. **`fts_status_event_handler`** (pre) — on force-cal event (`event[1]==0x05`),
+   restores saved `touch_id` so the event loop sees `touch_id != 0` → no BTN_UP
+3. **`fts_enter_pointer_event_handler`** (pre) — resets rearm counter on new
+   touch-down
+
+After restoring `touch_id`, schedules `setScanMode(LOCKED_ACTIVE)` via workqueue
+to re-arm the IC for the next cycle.
+
+### Build
+
+Requires `clang-18`, `lld-18`, `aarch64-linux-gnu-*` cross toolchain, and
+kernel headers at `../ftm5-patch/kernel-headers/common/`.
+
+```bash
+cd kprobe
+make        # cross-compile for ARM64
+```
+
+### Deploy
+
+```bash
+# Push to device (pipe method for FBE/mount namespace compatibility)
+cat kprobe/ftm5_kprobe.ko | adb shell "su -c 'cat > /data/local/tmp/ftm5_kprobe.ko'"
+
+# Load
+adb shell "su -c 'insmod /data/local/tmp/ftm5_kprobe.ko'"
+
+# Verify
+adb shell "su -c 'dmesg'" | grep ftm5_kprobe
+```
+
+### Key Struct Offsets (from ftm5.ko disassembly)
+
+| Field | Offset | Type |
+|-------|--------|------|
+| `touch_id` | 0x11B0 | `unsigned long` (touch slot bitmask) |
+| `palm_touch_mask` | 0x11B8 | `unsigned long` |
+| `grip_touch_mask` | 0x11C0 | `unsigned long` |
+
 ## Known Limitations
 
-- Continuous hold limited to ~4 seconds (12 force-cal cycles), then releases.
-  Re-touch immediately to continue. This is a hardware limitation: each
-  re-arm cycle absorbs more finger signal into the IC baseline until
-  detection fails.
-- Genuine finger lift delayed up to 600ms after long hold (SUPPRESS timeout).
+- **fts_filter**: Continuous hold limited to ~4 seconds (12 force-cal cycles).
+  Genuine finger lift delayed up to 600ms after long hold (SUPPRESS timeout).
+- **ftm5_kprobe**: Same 12-cycle limit (MAX_REARMS) as safety guard against IC
+  baseline degradation. Can be tuned higher if IC proves stable.
 - `CMD_FORCE_TOUCH_ACTIVE` (`A0 01`) is a bus/power management command, NOT
   an IC scan mode command. It keeps the SPI bus with AP but does not affect
   force-cal or re-detection.
@@ -137,17 +191,13 @@ All via `/proc/fts/driver_test`:
 
 | File | Description |
 |------|-------------|
-| `fts_filter.c` | EVIOCGRAB + uinput touch event filter (main fix) |
+| `fts_filter.c` | EVIOCGRAB + uinput touch event filter (userspace fix) |
+| `kprobe/ftm5_kprobe.c` | Kernel kprobe module (in-kernel force-cal suppression) |
+| `kprobe/Makefile` | Kprobe module build system (clang-18, ARM64 cross-compile) |
+| `kprobe/test_module.c` | Minimal test module for verifying build/load pipeline |
 | `fts_daemon.c` | Legacy daemon (no EVIOCGRAB, visible UP+DOWN glitches) |
-| `service.sh` | Magisk module boot script |
+| `service.sh` | Magisk module boot script (loads kprobe + starts fts_filter) |
 | `FINDINGS.md` | Full research notes and driver analysis |
-
-## Next Steps
-
-1. **Kernel kprobe module** — hook `fts_status_event_handler` to suppress
-   LEAVE_POINT during force-cal. Would eliminate the ~4s hold limit.
-2. **Optimize re-arm timing** — IC re-detection varies 5-915ms; adaptive
-   timeout could improve responsiveness.
 
 ## Device Info
 

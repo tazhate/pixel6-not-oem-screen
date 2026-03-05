@@ -25,9 +25,29 @@ pkill -9 fts_daemon 2>/dev/null
 pkill -9 fts_filter 2>/dev/null
 sleep 1
 
-# Start fts_filter: EVIOCGRAB + uinput touch event filter
+# Load kernel kprobe module: in-kernel force-cal suppression
+# Intercepts fts_leave/status/enter handlers to prevent spurious BTN_TOUCH UP.
+# Works alongside fts_filter (complementary layers).
+KPROBE="/data/local/tmp/ftm5_kprobe.ko"
+if [ -f "$KPROBE" ]; then
+    # Unload old instance if present
+    rmmod ftm5_kprobe 2>/dev/null
+    insmod "$KPROBE" 2>/dev/null
+    if [ $? -eq 0 ]; then
+        log -t "pixel6_touch_fix" "ftm5_kprobe loaded"
+    else
+        log -t "pixel6_touch_fix" "ftm5_kprobe insmod failed, trying force-load"
+        insmod -f "$KPROBE" 2>/dev/null && \
+            log -t "pixel6_touch_fix" "ftm5_kprobe force-loaded" || \
+            log -t "pixel6_touch_fix" "ftm5_kprobe failed to load"
+    fi
+else
+    log -t "pixel6_touch_fix" "ftm5_kprobe.ko not found, skipping"
+fi
+
+# Start fts_filter: EVIOCGRAB + uinput touch event filter (userspace fallback)
 # Grabs real touchscreen, filters force-cal glitches, forwards to uinput.
-# Replaces old stm_fts_cmd keepalive and fts_daemon.
+# With kprobe loaded, fts_filter provides additional safety net + keepalive.
 FILTER="/data/local/tmp/fts_filter"
 if [ -x "$FILTER" ]; then
     nohup "$FILTER" > /data/local/tmp/fts_filter.log 2>&1 &
